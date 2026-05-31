@@ -1,4 +1,5 @@
 ﻿# X/Twitter 批量视频下载器
+<img width="1442" height="1323" alt="9b20acc94b1e5e58a3ba9fa9ae89032f" src="https://github.com/user-attachments/assets/eacaa159-6508-40c0-b527-17a7b1eaf9fe" />
 
 一个基于 Python Tkinter 的 Windows 桌面工具，用于批量解析并下载 `x.com` / `twitter.com` 帖子中的视频。
 
