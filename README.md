@@ -2,18 +2,6 @@
 
 一个 Windows 桌面批量视频下载工具，基于 Python Tkinter 编写，可打包成单文件 exe 发布。用户使用发布版 exe 时不需要安装 Python。
 
-## 支持站点
-
-- `x.com`
-- `twitter.com`
-- `m.twitter.com` / `mobile.twitter.com`
-- `pornhub.com`
-- `www.pornhub.com`
-- `cn.pornhub.com`
-- `m.pornhub.com`
-- `truvaze.com`
-- `www.truvaze.com`
-
 ## 功能特性
 
 - 批量粘贴链接，一行一个。
@@ -106,6 +94,6 @@ SECURITY.md                      安全说明
 assets/                          图标资源备份
 ```
 
-## 界面命名
+## 友链
+[Linux.do](https://linux.do/)
 
-左上角标题显示为：`月之视频下载器 v当前版本号`。
