@@ -2,16 +2,6 @@
 
 一个 Windows 桌面批量视频下载工具，基于 Python Tkinter 编写，可打包成单文件 exe 发布。用户使用发布版 exe 时不需要安装 Python。
 
-## 支持站点
-
-- `x.com`
-- `twitter.com`
-- `m.twitter.com` / `mobile.twitter.com`
-- `pornhub.com`
-- `www.pornhub.com`
-- `cn.pornhub.com`
-- `m.pornhub.com`
-
 ## 功能特性
 
 - 批量粘贴链接，一行一个。
