@@ -4,7 +4,7 @@
 
 ## 版本
 
-- 当前源码版本：v3.3
+- 当前源码版本：v3.6
 - 主程序：`x_twitter_downloader.py`
 - GUI 框架：Tkinter
 - 网络下载：Python 标准库 `urllib.request`
@@ -38,6 +38,8 @@ pornhub.com
 www.pornhub.com
 cn.pornhub.com
 m.pornhub.com
+truvaze.com
+www.truvaze.com
 ```
 
 PornHub 域名单独由 `PORN_HUB_HOSTS` 判断。
@@ -51,6 +53,7 @@ PornHub 域名单独由 `PORN_HUB_HOSTS` 判断。
 
 - `x.com` / `twitter.com` / 移动端域名 → `X/Twitter`
 - `pornhub.com` / `cn.pornhub.com` / 移动端域名 → `PornHub`
+- `truvaze.com` / `www.truvaze.com` → `Truvaze`
 - 其它域名在未开启过滤时会显示原始 hostname，方便排查链接来源。
 
 识别结果保存在 `DownloadTask.site`，并显示在任务列表“站点”列。
@@ -72,6 +75,20 @@ https://x-twitter-downloader.com/api/parse-video
 5. 生成 `VideoOption` 列表。
 6. 使用 `choose_best_option()` 默认选择最高画质。
 7. 使用 `_download_direct_video()` 进行流式下载。
+
+## Truvaze 解析逻辑
+
+Truvaze 视频页面通常直接包含 Twitter 视频 CDN 的 mp4 地址。
+
+流程：
+
+1. 请求 Truvaze 视频详情页，例如 `/zh-CN/movie/<id>`。
+2. 优先解析页面中的 JSON-LD `VideoObject`。
+3. 从 `contentUrl` / `embedUrl` / `url` 字段提取 `video.twimg.com` mp4 直链。
+4. 兜底扫描 HTML 中出现的 `https://video.twimg.com/...mp4` 地址。
+5. 如果 URL 文件名包含当前 movie id，则优先只保留当前视频，避免误选相关推荐视频。
+6. 从 mp4 URL 路径中的 `1080x1440` 等字段推断清晰度和宽度。
+7. 后续复用直链下载逻辑下载文件。
 
 ## PornHub 解析逻辑
 
@@ -203,7 +220,7 @@ dist/XTwitter批量视频下载器.exe
 
 ## 动态下载队列
 
-从 v3.3 开始，批量下载线程使用持久下载队列：
+从 v3.6 开始，批量下载线程使用持久下载队列：
 
 - 点击“开始下载”后，会把当前未完成任务加入下载队列。
 - 下载运行中继续添加链接，新任务会自动进入当前下载队列。
@@ -213,7 +230,7 @@ dist/XTwitter批量视频下载器.exe
 
 ## 进度、大小和速度显示
 
-从 v3.3 开始：
+从 v3.6 开始：
 
 - 自动提取或下载响应头扫描到文件大小后，会立即写入任务的“文件大小”列。
 - “下载进度/大小”列显示百分比和 `已下载大小/总大小`。
@@ -222,10 +239,18 @@ dist/XTwitter批量视频下载器.exe
 
 ## 停止下载优化
 
-从 v3.3 开始：
+从 v3.6 开始：
 
 - 点击停止后立即设置全局停止事件。
 - 尚未开始的排队任务会立即标记为“已停止”。
 - m3u8 分片等待从 `as_completed()` 阻塞等待改为短间隔轮询 `wait(..., timeout=0.25)`。
 - 直链、m3u8 playlist、m3u8 分片请求使用更短的网络超时，避免卡住很久才响应停止。
+
+
+## v3.6 交互调整
+
+- 失败重试次数默认值改为 5。
+- 删除“自动选择最高画质”复选框，程序始终使用 `choose_best_option()` 自动选择最高画质。
+- 任务列表上方新增“重新下载失败视频”按钮，调用 `retry_failed_tasks()`。
+- 右键菜单新增“删除已下载视频文件”，会删除选中任务对应的本地文件，并把任务标记为已停止，方便后续重新下载。
 

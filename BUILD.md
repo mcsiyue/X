@@ -60,8 +60,12 @@ XTwitter批量视频下载器.exe
 
 ## 6. 功能验证建议
 
+- 确认默认重试次数为 5，且界面不再显示“自动选择最高画质”复选框。
+- 人为制造失败任务后，点击“重新下载失败视频”确认可以重试。
+- 对已下载任务右键选择“删除已下载视频文件”，确认本地文件被删除。
 - 添加多条 X/Twitter 链接，确认新任务出现在列表顶部。
-- 添加 X/Twitter 和 PornHub 视频链接，确认“站点”列能正确显示 `X/Twitter` / `PornHub`。
+- 添加 X/Twitter、PornHub 和 Truvaze 视频链接，确认“站点”列能正确显示 `X/Twitter` / `PornHub` / `Truvaze`。
+- 添加 Truvaze 视频链接，确认可以提取 `video.twimg.com` mp4 直链并显示文件大小。
 - 添加 PornHub 视频链接，确认可以提取标题、画质和直链/m3u8。
 - 确认 PornHub 默认选择最高画质。
 - 下载 PornHub m3u8 视频，确认状态依次显示“解析 m3u8 列表 / 下载分片 / 合并分片 / 写入最终文件”。
