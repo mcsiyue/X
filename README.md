@@ -101,3 +101,6 @@ SECURITY.md                      安全说明
 推特下载器图标_透明.png          托盘/资源图标
 assets/                          图标资源备份
 ```
+
+## 友链
+[Linux.do](https://linux.do/)
