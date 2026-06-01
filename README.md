@@ -56,3 +56,6 @@ dist/XTwitter批量视频下载器.exe
 - 如果下载失败，可点击“重试失败”。
 - 点击“文件大小”或“下载进度”表头可以排序。
 - 下载失败时会在当前目录生成 `downloader_error.log`，可用于排查问题。
+-
+## 友链
+linuxdo nodeseek
