@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-𝕏/Twitter 批量视频下载器 - 极简清新版
+𝕏/Twitter + PornHub 批量视频下载器 - 极简清新版
 
-- 批量粘贴 x.com / twitter.com 帖子链接
-- 调用 x-twitter-downloader.com 页面使用的接口提取视频直链
+- 批量粘贴 x.com / twitter.com 帖子链接、cn.pornhub.com 视频链接
+- Twitter 继续调用 x-twitter-downloader.com 接口提取视频直链
+- PornHub 通过页面 flashvars/mediaDefinitions 提取 mp4/m3u8 视频地址
 - 自动选择最高画质并下载到指定目录
 - 仅依赖 Python 标准库；可用 PyInstaller 打包为 exe
 """
@@ -17,6 +18,7 @@ import os
 import queue
 import re
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -24,6 +26,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from ctypes import wintypes
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -32,8 +35,8 @@ from typing import Any
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-APP_TITLE = "𝕏/Twitter 批量视频下载器"
-APP_VERSION = "2.8"
+APP_TITLE = "𝕏/Twitter + PornHub 批量视频下载器"
+APP_VERSION = "3.3"
 API_URL = "https://x-twitter-downloader.com/api/parse-video"
 REFERER = "https://x-twitter-downloader.com/zh-CN"
 LOG_FILE = Path("downloader_error.log")
@@ -44,7 +47,18 @@ SUPPORTED_HOSTS = {
     "x.com", "www.x.com",
     "twitter.com", "www.twitter.com",
     "m.twitter.com", "mobile.twitter.com",
+    "pornhub.com", "www.pornhub.com",
+    "cn.pornhub.com", "m.pornhub.com",
 }
+PORN_HUB_HOSTS = {"pornhub.com", "www.pornhub.com", "cn.pornhub.com", "m.pornhub.com"}
+TWITTER_HOSTS = {"x.com", "www.x.com", "twitter.com", "www.twitter.com", "m.twitter.com", "mobile.twitter.com"}
+PORN_HUB_REFERER = "https://cn.pornhub.com/"
+PORN_HUB_M3U8_WORKERS = 8
+DOWNLOAD_QUEUE_IDLE_SECONDS = 5.0
+DIRECT_DOWNLOAD_TIMEOUT = 15
+M3U8_PLAYLIST_TIMEOUT = 15
+M3U8_SEGMENT_TIMEOUT = 8
+STOP_POLL_INTERVAL = 0.25
 
 
 def resource_path(name: str) -> Path:
@@ -74,6 +88,7 @@ class VideoOption:
 class DownloadTask:
     task_id: str
     url: str
+    site: str = ""
     status: str = "等待"
     title: str = ""
     quality: str = ""
@@ -81,6 +96,12 @@ class DownloadTask:
     saved_path: str = ""
     file_size: int = 0
     error: str = ""
+    stage: str = ""
+    downloaded_size: int = 0
+    total_size: int = 0
+    download_speed: float = 0.0
+    speed_sample_time: float = 0.0
+    speed_sample_bytes: int = 0
     options: list[VideoOption] = field(default_factory=list)
 
 
@@ -186,6 +207,299 @@ def parse_duration(value: Any) -> str:
     return f"{s}s"
 
 
+def is_pornhub_url(url: str) -> bool:
+    host = (urllib.parse.urlparse(url).hostname or "").lower()
+    return host in PORN_HUB_HOSTS
+
+
+def detect_video_site(url: str) -> str:
+    host = (urllib.parse.urlparse(url).hostname or "").lower()
+    if host in PORN_HUB_HOSTS:
+        return "PornHub"
+    if host in TWITTER_HOSTS:
+        return "X/Twitter"
+    if host:
+        return host
+    return "未知"
+
+
+def html_unescape(text: str) -> str:
+    # Minimal unescape helper using only the standard library. PornHub embeds
+    # URLs both as JSON strings and as HTML-escaped script text.
+    try:
+        import html
+        return html.unescape(text)
+    except Exception:
+        return (
+            text.replace("&amp;", "&")
+            .replace("\\\\/", "/")
+            .replace("\\/", "/")
+        )
+
+
+def fetch_text(url: str, timeout: int = 60, extra_headers: dict[str, str | None] | None = None) -> tuple[str, str]:
+    req = make_request(url, extra_headers=extra_headers)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read()
+        content_type = resp.headers.get("Content-Type") or ""
+        charset = resp.headers.get_content_charset() or "utf-8"
+    return raw.decode(charset, "replace"), content_type
+
+
+def extract_balanced_json_after(html: str, marker_re: str) -> list[str]:
+    snippets: list[str] = []
+    for m in re.finditer(marker_re, html, flags=re.DOTALL):
+        start = html.find("{", m.end())
+        if start < 0:
+            continue
+        depth = 0
+        in_str = False
+        quote = ""
+        escape = False
+        for pos in range(start, len(html)):
+            ch = html[pos]
+            if in_str:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == quote:
+                    in_str = False
+                continue
+            if ch in ('"', "'"):
+                in_str = True
+                quote = ch
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    snippets.append(html[start:pos + 1])
+                    break
+    return snippets
+
+
+def parse_jsonish_object(snippet: str) -> dict[str, Any] | None:
+    snippet = html_unescape(snippet.strip())
+    try:
+        parsed = json.loads(snippet)
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        # The live page can contain escaped slashes or minor JS-style text. Keep
+        # this intentionally conservative so we do not mis-parse unrelated JS.
+        try:
+            parsed = json.loads(snippet.replace("\\/", "/"))
+            return parsed if isinstance(parsed, dict) else None
+        except Exception:
+            return None
+
+
+def normalize_pornhub_url(url: str) -> str:
+    parsed = urllib.parse.urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if host == "m.pornhub.com":
+        netloc = "cn.pornhub.com"
+        return urllib.parse.urlunparse(parsed._replace(netloc=netloc))
+    return url
+
+
+def extract_pornhub_title(html: str, fallback: str = "pornhub_video") -> str:
+    patterns = [
+        r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)',
+        r'<meta[^>]+name=["\']twitter:title["\'][^>]+content=["\']([^"\']+)',
+        r'<title[^>]*>(.*?)</title>',
+    ]
+    for pat in patterns:
+        m = re.search(pat, html, flags=re.IGNORECASE | re.DOTALL)
+        if not m:
+            continue
+        title = re.sub(r"\s+", " ", html_unescape(m.group(1))).strip()
+        title = re.sub(r"\s*[|-]\s*Pornhub.*$", "", title, flags=re.IGNORECASE).strip()
+        if title:
+            return title
+    return fallback
+
+
+def iter_media_definitions(value: Any) -> list[dict[str, Any]]:
+    found: list[dict[str, Any]] = []
+    if isinstance(value, dict):
+        media_defs = value.get("mediaDefinitions")
+        if isinstance(media_defs, list):
+            found.extend(item for item in media_defs if isinstance(item, dict))
+        for child in value.values():
+            found.extend(iter_media_definitions(child))
+    elif isinstance(value, list):
+        for child in value:
+            found.extend(iter_media_definitions(child))
+    return found
+
+
+def normalize_pornhub_media_item(item: dict[str, Any], default_quality: Any = "") -> dict[str, Any] | None:
+    direct_url = str(
+        item.get("videoUrl")
+        or item.get("video_url")
+        or item.get("url")
+        or item.get("src")
+        or item.get("m3u8")
+        or item.get("mp4")
+        or ""
+    ).strip()
+    if not direct_url:
+        return None
+    quality = item.get("quality") or item.get("format") or item.get("height") or default_quality or ""
+    if isinstance(quality, (dict, list)):
+        quality = ""
+    return {
+        "videoUrl": direct_url,
+        "quality": quality,
+        "format": item.get("format") or item.get("type") or "",
+        "width": item.get("width") or "",
+        "duration": item.get("duration") or item.get("video_duration") or "",
+        "raw": item,
+    }
+
+
+def flatten_pornhub_media_items(value: Any, default_quality: Any = "") -> list[dict[str, Any]]:
+    found: list[dict[str, Any]] = []
+    if isinstance(value, dict):
+        normalized = normalize_pornhub_media_item(value, default_quality)
+        if normalized:
+            found.append(normalized)
+        for key, child in value.items():
+            child_quality = default_quality
+            if str(key).isdigit():
+                child_quality = key
+            elif key in {"quality", "height", "format"}:
+                child_quality = child
+            found.extend(flatten_pornhub_media_items(child, child_quality))
+    elif isinstance(value, list):
+        for child in value:
+            found.extend(flatten_pornhub_media_items(child, default_quality))
+    return found
+
+
+def load_pornhub_media_url(media_url: str, page_url: str, timeout: int = 60) -> list[dict[str, Any]]:
+    media_url = resolve_url(page_url, media_url)
+    text, _ = fetch_text(
+        media_url,
+        timeout=timeout,
+        extra_headers={
+            "Accept": "application/json,text/plain,*/*",
+            "Referer": page_url,
+            "Origin": None,
+        },
+    )
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"PornHub 清晰度接口返回的不是 JSON：{text[:300]}") from exc
+    flattened = flatten_pornhub_media_items(parsed)
+    if flattened:
+        return flattened
+    if isinstance(parsed, list):
+        return [item for item in parsed if isinstance(item, dict)]
+    if isinstance(parsed, dict):
+        return iter_media_definitions(parsed) or [parsed]
+    return []
+
+
+def parse_pornhub_options(url: str) -> list[VideoOption]:
+    page_url = normalize_pornhub_url(url)
+    html, content_type = fetch_text(
+        page_url,
+        timeout=60,
+        extra_headers={
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Referer": PORN_HUB_REFERER,
+        },
+    )
+    if "text/html" not in content_type.lower() and "<html" not in html[:500].lower():
+        raise RuntimeError(f"PornHub 页面返回异常 Content-Type={content_type}")
+
+    title = extract_pornhub_title(html)
+    media_defs: list[dict[str, Any]] = []
+
+    # 参考项目的核心思路：从页面脚本中的 flashvars/mediaDefinitions 找到清晰度列表。
+    for snippet in extract_balanced_json_after(html, r"var\s+flashvars_[\w$]+\s*="):
+        obj = parse_jsonish_object(snippet)
+        if obj:
+            media_defs.extend(iter_media_definitions(obj))
+    if not media_defs:
+        for snippet in extract_balanced_json_after(html, r"(?:window\.)?flashvars\s*="):
+            obj = parse_jsonish_object(snippet)
+            if obj:
+                media_defs.extend(iter_media_definitions(obj))
+
+    # 有些页面 mediaDefinitions 里只有一个远程 JSON URL，需要再请求一次才能拿到各清晰度。
+    expanded: list[dict[str, Any]] = []
+    for media in media_defs:
+        media_url = str(media.get("videoUrl") or media.get("video_url") or media.get("url") or "")
+        quality = media.get("quality")
+        if media_url and ".json" in media_url.lower():
+            try:
+                expanded.extend(load_pornhub_media_url(media_url, page_url))
+                continue
+            except Exception as exc:
+                write_log(f"PornHub mediaDefinitions JSON 展开失败\npage={page_url}\nmedia={media_url}\nerror={describe_exception(exc)}")
+        expanded.append(media)
+    media_defs = expanded
+
+    options: list[VideoOption] = []
+    for i, media in enumerate(media_defs):
+        direct_url = str(media.get("videoUrl") or media.get("video_url") or media.get("url") or "")
+        direct_url = html_unescape(direct_url).strip()
+        if not direct_url:
+            continue
+        if direct_url.startswith("//"):
+            direct_url = "https:" + direct_url
+        if not direct_url.startswith("http"):
+            direct_url = urllib.parse.urljoin(page_url, direct_url)
+        quality_raw = media.get("quality") or media.get("format") or media.get("height") or ""
+        if isinstance(quality_raw, list):
+            quality_raw = ""
+        quality_text = str(quality_raw).strip()
+        if quality_text.isdigit():
+            quality_text = f"{quality_text}p"
+        fmt = "m3u8" if ".m3u8" in direct_url.lower() else str(media.get("format") or "mp4")
+        width = str(media.get("width") or "")
+        duration = parse_duration(media.get("duration") or media.get("video_duration"))
+        raw = dict(media)
+        raw["source"] = "pornhub"
+        options.append(VideoOption(i, title, quality_text, width, fmt, duration, direct_url, raw))
+
+    # Fallback：直接扫描页面里出现的 mp4/m3u8 URL，兼容页面结构变化。
+    if not options:
+        url_patterns = [
+            r'https?:\/\/[^"\']+?\.(?:mp4|m3u8)[^"\']*',
+            r'https?://[^"\']+?\.(?:mp4|m3u8)[^"\']*',
+        ]
+        for pat in url_patterns:
+            for raw_url in re.findall(pat, html, flags=re.IGNORECASE):
+                direct_url = html_unescape(raw_url).replace("\\\\/", "/").replace("\\/", "/")
+                quality_match = re.search(r"(\d{3,4})p", direct_url, flags=re.IGNORECASE)
+                quality_text = f"{quality_match.group(1)}p" if quality_match else ""
+                fmt = "m3u8" if ".m3u8" in direct_url.lower() else "mp4"
+                options.append(VideoOption(len(options), title, quality_text, "", fmt, "", direct_url, {"source": "pornhub-scan"}))
+
+    seen: set[str] = set()
+    unique: list[VideoOption] = []
+    for opt in options:
+        if opt.direct_url in seen:
+            continue
+        seen.add(opt.direct_url)
+        unique.append(opt)
+
+    unique.sort(key=option_score, reverse=True)
+    if not unique:
+        lower = html.lower()
+        if "removed" in lower or "deleted" in lower:
+            raise RuntimeError("PornHub 页面未找到可下载视频，视频可能已删除。")
+        if "premium" in lower:
+            raise RuntimeError("PornHub 页面未找到可下载视频，可能需要登录或会员权限。")
+        raise RuntimeError("PornHub 页面中没有找到 mediaDefinitions 或可下载直链。")
+    return unique
+
+
 def normalize_options(result: dict[str, Any]) -> list[VideoOption]:
     videos = result.get("videos") or []
     if not isinstance(videos, list):
@@ -231,11 +545,13 @@ def number_from_text(value: Any) -> int:
         return 0
 
 
-def option_score(opt: VideoOption) -> tuple[int, int, int]:
+def option_score(opt: VideoOption) -> tuple[int, int, int, int]:
     width = number_from_text(opt.width)
     height = number_from_text(opt.quality)
     bitrate = number_from_text(opt.raw.get("bitrate") or opt.raw.get("qualityDesc"))
-    return (height, width, bitrate)
+    # 同清晰度时优先选 mp4/直链，避免不必要的 m3u8 分片下载。
+    direct_file_bonus = 0 if (".m3u8" in opt.direct_url.lower() or opt.fmt.lower() == "m3u8") else 1
+    return (height, width, direct_file_bonus, bitrate)
 
 
 def choose_best_option(options: list[VideoOption]) -> VideoOption:
@@ -300,6 +616,28 @@ def format_file_size(size: int) -> str:
     return f"{size} B"
 
 
+def format_speed(bytes_per_second: float) -> str:
+    if not bytes_per_second or bytes_per_second <= 0:
+        return "-"
+    return f"{format_file_size(int(bytes_per_second))}/s"
+
+
+def format_transfer_progress(task: DownloadTask) -> str:
+    pct = max(0, min(100, task.progress))
+    downloaded = max(0, int(task.downloaded_size or 0))
+    total = max(0, int(task.total_size or 0))
+    if task.status == "完成":
+        final_size = total or downloaded
+        if final_size:
+            return f"100% {format_file_size(final_size)}/{format_file_size(final_size)}"
+        return "100%"
+    if downloaded or total:
+        left = format_file_size(downloaded) if downloaded else "0 B"
+        right = format_file_size(total) if total else "未知"
+        return f"{pct:.0f}% {left}/{right}"
+    return f"{pct:.0f}%"
+
+
 def parse_content_length(headers: Any) -> int:
     content_range = headers.get("Content-Range") or ""
     m = re.search(r"/(\d+)$", content_range)
@@ -314,13 +652,17 @@ def parse_content_length(headers: Any) -> int:
         return 0
 
 
-def probe_direct_file_size(url: str, timeout: int = 30) -> int:
-    strategies = [
-        ("HEAD", {"Referer": "https://x.com/"}),
-        ("GET", {"Referer": "https://x.com/", "Range": "bytes=0-0"}),
-        ("HEAD", {"Referer": REFERER}),
-        ("GET", {"Referer": REFERER, "Range": "bytes=0-0"}),
-    ]
+def probe_direct_file_size(url: str, timeout: int = 30, referer: str | None = None) -> int:
+    referers = [referer] if referer else []
+    referers.extend(["https://x.com/", REFERER, PORN_HUB_REFERER])
+    strategies: list[tuple[str, dict[str, str]]] = []
+    seen_refs: set[str] = set()
+    for ref in referers:
+        if not ref or ref in seen_refs:
+            continue
+        seen_refs.add(ref)
+        strategies.append(("HEAD", {"Referer": ref}))
+        strategies.append(("GET", {"Referer": ref, "Range": "bytes=0-0"}))
     for method, headers in strategies:
         try:
             req = make_request(url, method=method, extra_headers=headers)
@@ -332,6 +674,64 @@ def probe_direct_file_size(url: str, timeout: int = 30) -> int:
         except Exception:
             continue
     return 0
+
+
+def resolve_url(base_url: str, maybe_url: str) -> str:
+    maybe_url = html_unescape(maybe_url).strip().replace("\\/", "/")
+    if maybe_url.startswith("//"):
+        return "https:" + maybe_url
+    return urllib.parse.urljoin(base_url, maybe_url)
+
+
+def read_m3u8_entries(m3u8_url: str, referer: str) -> tuple[str, list[str]]:
+    text, _ = fetch_text(
+        m3u8_url,
+        timeout=M3U8_PLAYLIST_TIMEOUT,
+        extra_headers={
+            "Accept": "application/vnd.apple.mpegurl,application/x-mpegURL,text/plain,*/*",
+            "Referer": referer,
+        },
+    )
+    entries: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        entries.append(resolve_url(m3u8_url, line))
+    return text, entries
+
+
+def choose_m3u8_variant(master_text: str, entries: list[str]) -> str | None:
+    stream_infos: list[tuple[int, str]] = []
+    last_score = 0
+    entry_idx = 0
+    for raw_line in master_text.splitlines():
+        line = raw_line.strip()
+        if line.startswith("#EXT-X-STREAM-INF"):
+            score = 0
+            res = re.search(r"RESOLUTION=(\d+)x(\d+)", line, flags=re.IGNORECASE)
+            bw = re.search(r"BANDWIDTH=(\d+)", line, flags=re.IGNORECASE)
+            if res:
+                try:
+                    score += int(res.group(2)) * 10_000 + int(res.group(1))
+                except ValueError:
+                    pass
+            if bw:
+                try:
+                    score += int(bw.group(1)) // 1000
+                except ValueError:
+                    pass
+            last_score = score
+        elif line and not line.startswith("#"):
+            if entry_idx < len(entries):
+                stream_infos.append((last_score, entries[entry_idx]))
+            entry_idx += 1
+            last_score = 0
+    if stream_infos:
+        return max(stream_infos, key=lambda item: item[0])[1]
+    if entries and any(".m3u8" in entry.lower() for entry in entries):
+        return entries[0]
+    return None
 
 
 def extract_urls(text: str) -> list[str]:
@@ -740,7 +1140,7 @@ class BatchDownloaderApp(tk.Tk):
         self.retry_var = tk.IntVar(value=2)
         self.concurrent_var = tk.IntVar(value=3)
         self.auto_extract_var = tk.BooleanVar(value=True)
-        self.placeholder = "请在此输入或粘贴 𝕏/Twitter 帖子链接... (支持批量粘贴，一行一个)"
+        self.placeholder = "请在此输入或粘贴 𝕏/Twitter 或 PornHub 视频链接... (支持批量粘贴，一行一个)"
 
         self.tasks: list[DownloadTask] = []
         self.task_counter = 0
@@ -749,6 +1149,9 @@ class BatchDownloaderApp(tk.Tk):
         self.extract_queue: queue.Queue[tuple[DownloadTask, bool]] = queue.Queue()
         self.extract_workers: list[threading.Thread] = []
         self.extract_lock = threading.Lock()
+        self.download_queue: queue.Queue[DownloadTask] = queue.Queue()
+        self.download_queue_ids: set[str] = set()
+        self.download_queue_lock = threading.Lock()
         self.stop_event = threading.Event()
         self.file_lock = threading.Lock()
         self.sort_column: str | None = None
@@ -977,8 +1380,8 @@ class BatchDownloaderApp(tk.Tk):
         text_col = tk.Frame(title_frame, bg="#FFFFFF")
         text_col.pack(side=tk.LEFT)
         
-        tk.Label(text_col, text="Twitter 批量视频下载器", font=("Microsoft YaHei UI", 13, "bold"), bg="#FFFFFF", fg=TEXT_MAIN).pack(anchor=tk.W)
-        tk.Label(text_col, text="简洁、快速的 Twitter 视频高清直链解析与批量下载工具", font=("Microsoft YaHei UI", 8), bg="#FFFFFF", fg=TEXT_MUTED).pack(anchor=tk.W, pady=(2, 0))
+        tk.Label(text_col, text="Twitter + PornHub 批量视频下载器", font=("Microsoft YaHei UI", 13, "bold"), bg="#FFFFFF", fg=TEXT_MAIN).pack(anchor=tk.W)
+        tk.Label(text_col, text="简洁、快速的视频高清直链解析与批量下载工具", font=("Microsoft YaHei UI", 8), bg="#FFFFFF", fg=TEXT_MUTED).pack(anchor=tk.W, pady=(2, 0))
         
         # Stylized SaaS Pill Badge (Right Align)
         badge_border = tk.Frame(title_frame, bg="#DBEAFE", bd=0, highlightthickness=1, highlightbackground="#BFDBFE")
@@ -1027,7 +1430,7 @@ class BatchDownloaderApp(tk.Tk):
         cb_auto.pack(side=tk.LEFT, padx=(0, 20))
         
         cb_skip = tk.Checkbutton(
-            row_cfg, text="智能过滤非 Twitter 链接", variable=self.skip_invalid_var,
+            row_cfg, text="智能过滤非支持站点链接", variable=self.skip_invalid_var,
             bg="#FFFFFF", fg=TEXT_MAIN, selectcolor="#FFFFFF", activebackground="#FFFFFF",
             activeforeground=TEXT_MAIN, font=("Microsoft YaHei UI", 9), relief="flat", bd=0
         )
@@ -1113,7 +1516,7 @@ class BatchDownloaderApp(tk.Tk):
             
         cb_auto.bind("<Enter>", set_status_hint("💡 选项设置：自动匹配并下载解析到的最高清晰度视频。"))
         cb_auto.bind("<Leave>", reset_status_hint)
-        cb_skip.bind("<Enter>", set_status_hint("💡 选项设置：自动忽略非 Twitter/𝕏 的其它无效网页链接。"))
+        cb_skip.bind("<Enter>", set_status_hint("💡 选项设置：自动忽略非支持站点的其它无效网页链接。"))
         cb_skip.bind("<Leave>", reset_status_hint)
         self.retry_spin.bind("<Enter>", set_status_hint("💡 重试次数：当遇到网络错误时，自动尝试重新下载视频的次数上限。"))
         self.retry_spin.bind("<Leave>", reset_status_hint)
@@ -1204,18 +1607,18 @@ class BatchDownloaderApp(tk.Tk):
         table_border = tk.Frame(grid_card, bg=BORDER_COLOR, bd=0, highlightthickness=1, highlightbackground=BORDER_COLOR)
         table_border.pack(fill=tk.BOTH, expand=True, padx=20, pady=(0, 20))
         
-        columns = ("no", "status", "progress", "quality", "size", "title", "url", "file")
+        columns = ("no", "site", "status", "progress", "speed", "quality", "size", "title", "url", "file")
         self.tree = ttk.Treeview(table_border, columns=columns, show="headings", selectmode="extended")
         
         headings = {
-            "no": "#", "status": "下载状态", "progress": "下载进度", "quality": "所选画质",
-            "size": "文件大小", "title": "视频标题", "url": "原帖链接", "file": "保存路径/错误说明"
+            "no": "#", "site": "站点", "status": "下载状态", "progress": "下载进度/大小", "speed": "下载速度", "quality": "所选画质",
+            "size": "文件大小", "title": "视频标题", "url": "原始链接", "file": "保存路径/错误说明"
         }
         widths = {
-            "no": 40, "status": 105, "progress": 85, "quality": 95, "size": 90,
-            "title": 200, "url": 170, "file": 250
+            "no": 40, "site": 80, "status": 160, "progress": 150, "speed": 85, "quality": 75, "size": 80,
+            "title": 140, "url": 100, "file": 150
         }
-        anchors = {"no": tk.CENTER, "status": tk.CENTER, "progress": tk.CENTER, "quality": tk.CENTER, "size": tk.CENTER}
+        anchors = {"no": tk.CENTER, "site": tk.CENTER, "status": tk.CENTER, "progress": tk.CENTER, "speed": tk.CENTER, "quality": tk.CENTER, "size": tk.CENTER}
         self.tree_headings = headings.copy()
         
         for col in columns:
@@ -1235,7 +1638,7 @@ class BatchDownloaderApp(tk.Tk):
 
         # Create Treeview Right-Click Menu
         self.context_menu = tk.Menu(self, tearoff=0, bg="#FFFFFF", fg=TEXT_MAIN, activebackground=PRIMARY_BLUE, activeforeground="#FFFFFF", font=("Microsoft YaHei UI", 9))
-        self.context_menu.add_command(label="🔗 复制帖子网页链接", command=self.copy_post_url)
+        self.context_menu.add_command(label="🔗 复制原始网页链接", command=self.copy_post_url)
         self.context_menu.add_command(label="⬇ 复制视频下载直链", command=self.copy_direct_url)
         self.context_menu.add_separator()
         self.context_menu.add_command(label="📁 播放视频/打开文件", command=self.open_selected_file)
@@ -1295,7 +1698,7 @@ class BatchDownloaderApp(tk.Tk):
         if task:
             self.clipboard_clear()
             self.clipboard_append(task.url)
-            self.status_var.set("已成功复制帖子网页链接！")
+            self.status_var.set("已成功复制原始网页链接！")
 
     def copy_direct_url(self) -> None:
         selected = self.selected_task_ids()
@@ -1372,10 +1775,14 @@ class BatchDownloaderApp(tk.Tk):
                 return int(task.task_id)
             except ValueError:
                 return task.task_id
+        if column == "site":
+            return (task.site or detect_video_site(task.url)).lower()
         if column == "status":
             return status_order.get(task.status, 99)
         if column == "progress":
             return float(task.progress)
+        if column == "speed":
+            return float(task.download_speed or 0)
         if column == "size":
             return int(task.file_size or 0)
         if column == "quality":
@@ -1393,7 +1800,7 @@ class BatchDownloaderApp(tk.Tk):
             self.sort_reverse = not self.sort_reverse
         else:
             self.sort_column = column
-            self.sort_reverse = column in {"progress", "size"}
+            self.sort_reverse = column in {"progress", "speed", "size"}
         self._apply_current_sort()
 
     def _apply_current_sort(self) -> None:
@@ -1420,6 +1827,7 @@ class BatchDownloaderApp(tk.Tk):
             return
         added = 0
         new_tasks: list[DownloadTask] = []
+        batch_running = self._is_download_running()
         existing = {task.url for task in self.tasks}
         for url in reversed(urls):
             host = (urllib.parse.urlparse(url).hostname or "").lower()
@@ -1428,20 +1836,24 @@ class BatchDownloaderApp(tk.Tk):
             if url in existing:
                 continue
             self.task_counter += 1
-            task = DownloadTask(task_id=str(self.task_counter), url=url)
+            task = DownloadTask(task_id=str(self.task_counter), url=url, site=detect_video_site(url))
             self.tasks.insert(0, task)
             new_tasks.insert(0, task)
             self.tree.insert("", 0, iid=task.task_id, values=self._task_values(task), tags=("even",))
             existing.add(url)
             added += 1
-            if self.auto_extract_var.get():
+            if self.auto_extract_var.get() and not batch_running:
                 self.start_auto_extract_tasks([task])
 
         if added == 0:
             messagebox.showinfo(APP_TITLE, "\u6ca1\u6709\u65b0\u589e\u4efb\u52a1\uff1b\u53ef\u80fd\u662f\u91cd\u590d\u94fe\u63a5\u6216\u88ab\u8bbe\u7f6e\u8fc7\u6ee4\u3002")
         else:
             self._refresh_tree_tags()
-            self.log(f"\u5df2\u6dfb\u52a0 {added} \u4e2a\u4efb\u52a1\u3002")
+            if batch_running:
+                queued = sum(1 for task in new_tasks if self._enqueue_download_task(task))
+                self.log(f"已添加 {added} 个任务；下载正在运行，已加入当前下载队列 {queued} 个。")
+            else:
+                self.log(f"\u5df2\u6dfb\u52a0 {added} \u4e2a\u4efb\u52a1\u3002")
             self.url_text.delete("1.0", tk.END)
             self.url_text.insert("1.0", self.placeholder)
             self.url_text.configure(fg=TEXT_MUTED)
@@ -1449,20 +1861,24 @@ class BatchDownloaderApp(tk.Tk):
 
     def _task_values(self, task: DownloadTask) -> tuple[Any, ...]:
         progress = f"{task.progress:.0f}%" if task.progress else "0%"
-        progress_bar = get_progress_bar_text(task.progress)
+        stage = task.stage.strip() if task.stage else ""
         status_map = {
             "等待": "⏳ 等待中",
-            "提取中": "⚙ 提取中",
-            "下载中": f"⬇ 下载中 ({progress})",
+            "提取中": f"⚙ {stage or '提取中'}",
+            "下载中": f"⬇ {stage or f'下载中 ({progress})'}",
             "完成": "✔ 已完成",
             "失败": "✘ 失败",
             "已停止": "⏸ 已停止",
         }
         status_str = status_map.get(task.status, task.status)
+        progress_str = format_transfer_progress(task) if task.status in {"下载中", "完成"} else "-"
+        speed_str = format_speed(task.download_speed) if task.status == "下载中" else "-"
         return (
             task.task_id,
+            task.site or detect_video_site(task.url),
             status_str,
-            progress_bar if task.status == "下载中" else "-",
+            progress_str,
+            speed_str,
             task.quality or "-",
             format_file_size(task.file_size),
             task.title or "-",
@@ -1500,6 +1916,10 @@ class BatchDownloaderApp(tk.Tk):
             task.progress = 0
             task.saved_path = ""
             task.file_size = 0
+            task.total_size = 0
+            task.downloaded_size = 0
+            task.download_speed = 0.0
+            task.stage = ""
             task.error = ""
             self.update_task_row(task)
         self.update_stats()
@@ -1577,34 +1997,90 @@ class BatchDownloaderApp(tk.Tk):
             if task.status == '提取中':
                 task.status = '等待'
                 task.progress = 0
+                task.stage = ""
             self.ui_queue.put(("task", task))
             self.ui_queue.put(("log", f"\u63d0\u53d6\u5b8c\u6210\uff1a{opt.title}"))
         except Exception as exc:
             msg = describe_exception(exc)
             task.status = '失败'
             task.error = msg.splitlines()[0][:240]
+            task.stage = ""
             self.ui_queue.put(("task", task))
             self.ui_queue.put(("log", f"\u63d0\u53d6\u5931\u8d25\uff1a{task.url} - {task.error}"))
             write_log("\u961f\u5217\u81ea\u52a8\u63d0\u53d6\u5931\u8d25\n" + f"url={task.url}\n" + msg + "\n" + traceback.format_exc())
 
     def _extract_task_option(self, task: DownloadTask, auto_best: bool, probe_size: bool = False) -> VideoOption:
+        if not task.site:
+            task.site = detect_video_site(task.url)
         if not task.options:
-            result = post_json(API_URL, {"url": task.url})
-            if not result.get("success"):
-                raise RuntimeError(str(result.get("error") or "\u63d0\u53d6\u5931\u8d25\uff0c\u63a5\u53e3\u672a\u8fd4\u56de\u6210\u529f\u72b6\u6001"))
-            options = normalize_options(result)
+            if is_pornhub_url(task.url):
+                options = parse_pornhub_options(task.url)
+            else:
+                result = post_json(API_URL, {"url": task.url})
+                if not result.get("success"):
+                    raise RuntimeError(str(result.get("error") or "\u63d0\u53d6\u5931\u8d25\uff0c\u63a5\u53e3\u672a\u8fd4\u56de\u6210\u529f\u72b6\u6001"))
+                options = normalize_options(result)
             if not options:
                 raise RuntimeError("\u6ca1\u6709\u627e\u5230\u53ef\u4e0b\u8f7d\u7684\u89c6\u9891\u76f4\u94fe\u3002")
             task.options = options
         opt = choose_best_option(task.options) if auto_best else task.options[0]
         task.title = opt.title
         task.quality = opt.quality_label
-        if probe_size and not task.file_size:
-            size = probe_direct_file_size(opt.direct_url)
+        if probe_size and not task.file_size and ".m3u8" not in opt.direct_url.lower():
+            size = probe_direct_file_size(opt.direct_url, referer=PORN_HUB_REFERER if is_pornhub_url(task.url) else None)
             if size:
                 task.file_size = size
+                task.total_size = size
         self.ui_queue.put(("task", task))
         return opt
+
+    def _is_download_running(self) -> bool:
+        return bool(self.worker_thread and self.worker_thread.is_alive())
+
+    def _reset_download_queue(self) -> None:
+        with self.download_queue_lock:
+            self.download_queue = queue.Queue()
+            self.download_queue_ids.clear()
+
+    def _enqueue_download_task(self, task: DownloadTask) -> bool:
+        if task.status in {"完成", "下载中"}:
+            return False
+        with self.download_queue_lock:
+            if task.task_id in self.download_queue_ids:
+                return False
+            self.download_queue_ids.add(task.task_id)
+            self.download_queue.put(task)
+            return True
+
+    def _mark_download_task_dequeued(self, task: DownloadTask) -> None:
+        with self.download_queue_lock:
+            self.download_queue_ids.discard(task.task_id)
+
+    def _enqueue_pending_download_tasks(self) -> int:
+        count = 0
+        for task in list(self.tasks):
+            if self._enqueue_download_task(task):
+                count += 1
+        return count
+
+    def _cancel_queued_download_tasks(self) -> int:
+        cancelled = 0
+        while True:
+            try:
+                task = self.download_queue.get_nowait()
+            except queue.Empty:
+                break
+            self._mark_download_task_dequeued(task)
+            try:
+                if task.status not in {"完成", "下载中"}:
+                    task.status = "已停止"
+                    task.stage = ""
+                    task.download_speed = 0.0
+                    self.ui_queue.put(("task", task))
+                    cancelled += 1
+            finally:
+                self.download_queue.task_done()
+        return cancelled
 
     def start_batch(self) -> None:
         if not self.tasks:
@@ -1620,8 +2096,11 @@ class BatchDownloaderApp(tk.Tk):
         except OSError as exc:
             messagebox.showerror(APP_TITLE, f"保存目录不可用：\n{exc}")
             return
-        if self.worker_thread and self.worker_thread.is_alive():
+        if self._is_download_running():
+            queued = self._enqueue_pending_download_tasks()
+            self.log(f"下载正在运行，已补充 {queued} 个未完成任务到当前下载队列。")
             return
+        self._reset_download_queue()
         self.stop_event.clear()
         try:
             concurrency = max(1, min(10, int(self.concurrent_var.get())))
@@ -1644,7 +2123,11 @@ class BatchDownloaderApp(tk.Tk):
 
     def stop_batch(self) -> None:
         self.stop_event.set()
-        self.log("正在停止，当前文件会尽快中断。")
+        cancelled = self._cancel_queued_download_tasks()
+        if cancelled:
+            self.log(f"正在停止，已取消 {cancelled} 个排队任务，当前下载会尽快中断。")
+        else:
+            self.log("正在停止，当前下载会尽快中断。")
 
     def _batch_worker(self, folder: Path, concurrency: int, retry_count: int, auto_best: bool) -> None:
         try:
@@ -1656,48 +2139,58 @@ class BatchDownloaderApp(tk.Tk):
             self.ui_queue.put(("finished", (0, len([t for t in self.tasks if t.status != "完成"]))))
 
     def _batch_worker_impl(self, folder: Path, concurrency: int, retry_count: int, auto_best: bool) -> None:
-        pending = [task for task in self.tasks if task.status not in {"完成"}]
-        total = len(pending)
-        if total == 0:
+        queued = self._enqueue_pending_download_tasks()
+        if queued == 0:
             self.ui_queue.put(("finished", (0, 0)))
             return
 
-        task_queue: queue.Queue[DownloadTask] = queue.Queue()
-        for task in pending:
-            task_queue.put(task)
+        idle_timeout = max(1.0, float(DOWNLOAD_QUEUE_IDLE_SECONDS))
 
         def worker(worker_id: int) -> None:
+            idle_until = time.monotonic() + idle_timeout
             while True:
-                try:
-                    task = task_queue.get_nowait()
-                except queue.Empty:
+                if self.stop_event.is_set() and self.download_queue.empty():
                     return
                 try:
+                    task = self.download_queue.get(timeout=0.5)
+                except queue.Empty:
+                    if time.monotonic() >= idle_until:
+                        return
+                    continue
+
+                idle_until = time.monotonic() + idle_timeout
+                self._mark_download_task_dequeued(task)
+                try:
+                    if task.status == "完成":
+                        continue
                     if self.stop_event.is_set():
-                        task.status = "\u5df2\u505c\u6b62"
+                        task.status = "已停止"
+                        task.stage = ""
                         self.ui_queue.put(("task", task))
                         continue
                     self._process_download_task(task, folder, retry_count, auto_best, worker_id)
                 finally:
-                    task_queue.task_done()
+                    self.download_queue.task_done()
 
         workers: list[threading.Thread] = []
-        for i in range(min(concurrency, total)):
+        for i in range(max(1, concurrency)):
             t = threading.Thread(target=worker, args=(i + 1,), daemon=True)
             workers.append(t)
             t.start()
         for t in workers:
             t.join()
 
-        done = sum(1 for task in pending if task.status == "\u5b8c\u6210")
-        self.ui_queue.put(("finished", (done, total)))
+        all_tasks = list(self.tasks)
+        done = sum(1 for task in all_tasks if task.status == "完成")
+        self.ui_queue.put(("finished", (done, len(all_tasks))))
 
     def _process_download_task(self, task: DownloadTask, folder: Path, retry_count: int, auto_best: bool, worker_id: int) -> None:
         try:
             if not task.options:
-                self._set_task(task, status="\u63d0\u53d6\u4e2d", progress=0, error="", file_size=0)
+                self._set_task(task, status="提取中", progress=0, error="", file_size=0, stage="解析页面/接口")
             opt = self._extract_task_option(task, auto_best, probe_size=False)
-            self._set_task(task, status="\u4e0b\u8f7d\u4e2d", progress=0)
+            self._reset_transfer_stats(task)
+            self._set_task(task, status="下载中", progress=0, stage="准备下载")
             saved = self._download_video(task, opt, folder, retry_count)
             task.saved_path = str(saved)
             if not task.file_size:
@@ -1706,36 +2199,89 @@ class BatchDownloaderApp(tk.Tk):
                 except OSError:
                     pass
             task.progress = 100
-            task.status = "\u5b8c\u6210"
+            if not task.downloaded_size and task.file_size:
+                task.downloaded_size = task.file_size
+            task.download_speed = 0.0
+            task.stage = ""
+            task.status = "完成"
             self.ui_queue.put(("task", task))
-            self.ui_queue.put(("log", f"\u7ebf\u7a0b {worker_id} \u5b8c\u6210\uff1a{saved.name}"))
+            self.ui_queue.put(("log", f"线程 {worker_id} 完成：{saved.name}"))
         except Exception as exc:
             msg = describe_exception(exc)
-            if self.stop_event.is_set() or "\u7528\u6237\u505c\u6b62\u4e0b\u8f7d" in msg:
-                task.status = "\u5df2\u505c\u6b62"
-                task.error = "\u7528\u6237\u505c\u6b62\u4e0b\u8f7d"
+            if self.stop_event.is_set() or "用户停止下载" in msg:
+                task.status = "已停止"
+                task.error = "用户停止下载"
+                task.stage = ""
                 self.ui_queue.put(("task", task))
-                self.ui_queue.put(("log", f"\u5df2\u505c\u6b62\uff1a{task.url}"))
+                self.ui_queue.put(("log", f"已停止：{task.url}"))
                 return
-            task.status = "\u5931\u8d25"
+            task.status = "失败"
             task.error = msg.splitlines()[0][:240]
+            task.stage = ""
             self.ui_queue.put(("task", task))
-            self.ui_queue.put(("log", f"\u5931\u8d25\uff1a{task.url} - {task.error}"))
-            write_log("\u4efb\u52a1\u5931\u8d25\n" + f"url={task.url}\n" + msg + "\n" + traceback.format_exc())
+            self.ui_queue.put(("log", f"失败：{task.url} - {task.error}"))
+            write_log("任务失败\n" + f"url={task.url}\n" + msg + "\n" + traceback.format_exc())
 
     def _set_task(self, task: DownloadTask, **kwargs: Any) -> None:
         for key, value in kwargs.items():
             setattr(task, key, value)
         self.ui_queue.put(("task", task))
 
+    def _reset_transfer_stats(self, task: DownloadTask) -> None:
+        task.downloaded_size = 0
+        if task.file_size and not task.total_size:
+            task.total_size = task.file_size
+        task.download_speed = 0.0
+        task.speed_sample_time = time.monotonic()
+        task.speed_sample_bytes = 0
+
+    def _update_transfer_stats(self, task: DownloadTask, downloaded: int, total: int = 0) -> None:
+        now = time.monotonic()
+        downloaded = max(0, int(downloaded or 0))
+        task.downloaded_size = downloaded
+        if total:
+            task.total_size = max(int(total), downloaded)
+            task.file_size = task.total_size
+        if not task.speed_sample_time:
+            task.speed_sample_time = now
+            task.speed_sample_bytes = downloaded
+            return
+        elapsed = now - task.speed_sample_time
+        if elapsed >= 0.5:
+            delta = downloaded - task.speed_sample_bytes
+            if delta >= 0:
+                task.download_speed = delta / elapsed
+            task.speed_sample_time = now
+            task.speed_sample_bytes = downloaded
+
+    def _referers_for_task(self, task: DownloadTask) -> list[str | None]:
+        if is_pornhub_url(task.url):
+            return [task.url, PORN_HUB_REFERER, "https://www.pornhub.com/", None]
+        return ["https://x.com/", "https://twitter.com/", REFERER, None]
+
+    def _build_video_base_path(self, folder: Path, opt: VideoOption, ext: str) -> Path:
+        base_bits = [sanitize_filename(opt.title)]
+        if opt.quality:
+            base_bits.append(sanitize_filename(str(opt.quality), 24))
+        base_name = "_".join([b for b in base_bits if b])
+        with self.file_lock:
+            final_path = unique_path(folder, base_name, ext)
+            tmp_path = final_path.with_suffix(final_path.suffix + ".part")
+            tmp_path.touch(exist_ok=False)
+        return final_path
+
     def _download_video(self, task: DownloadTask, opt: VideoOption, folder: Path, retry_count: int) -> Path:
+        if ".m3u8" in opt.direct_url.lower() or opt.fmt.lower() == "m3u8":
+            return self._download_m3u8_video(task, opt, folder, retry_count)
+        return self._download_direct_video(task, opt, folder, retry_count)
+
+    def _download_direct_video(self, task: DownloadTask, opt: VideoOption, folder: Path, retry_count: int) -> Path:
         tmp_path: Path | None = None
         final_path: Path | None = None
         last_error = "未知错误"
         max_attempts = max(1, int(retry_count) + 1)
-        referers: list[str | None] = ["https://x.com/", "https://twitter.com/", REFERER, None]
         strategies: list[tuple[str | None, bool]] = []
-        for ref in referers:
+        for ref in self._referers_for_task(task):
             strategies.append((ref, False))
             strategies.append((ref, True))
 
@@ -1751,7 +2297,7 @@ class BatchDownloaderApp(tk.Tk):
                     if use_range:
                         headers["Range"] = "bytes=0-"
                     req = make_request(opt.direct_url, extra_headers=headers)
-                    with urllib.request.urlopen(req, timeout=180) as resp:
+                    with urllib.request.urlopen(req, timeout=DIRECT_DOWNLOAD_TIMEOUT) as resp:
                         content_type = (resp.headers.get("Content-Type") or "").lower()
                         total = int(resp.headers.get("Content-Length") or 0)
                         content_range = resp.headers.get("Content-Range") or ""
@@ -1771,14 +2317,8 @@ class BatchDownloaderApp(tk.Tk):
                             raise RuntimeError(f"服务器返回的不是视频文件，Content-Type={content_type}\n{preview}")
 
                         ext = guess_ext(resp.geturl(), content_type)
-                        base_bits = [sanitize_filename(opt.title)]
-                        if opt.quality:
-                            base_bits.append(sanitize_filename(str(opt.quality), 24))
-                        base_name = "_".join([b for b in base_bits if b])
-                        with self.file_lock:
-                            final_path = unique_path(folder, base_name, ext)
-                            tmp_path = final_path.with_suffix(final_path.suffix + ".part")
-                            tmp_path.touch(exist_ok=False)
+                        final_path = self._build_video_base_path(folder, opt, ext)
+                        tmp_path = final_path.with_suffix(final_path.suffix + ".part")
                         downloaded = 0
                         with tmp_path.open("wb") as f:
                             f.write(first)
@@ -1787,7 +2327,7 @@ class BatchDownloaderApp(tk.Tk):
                             while True:
                                 if self.stop_event.is_set():
                                     raise RuntimeError("用户停止下载")
-                                chunk = resp.read(1024 * 256)
+                                chunk = resp.read(1024 * 1024)
                                 if not chunk:
                                     break
                                 f.write(chunk)
@@ -1817,11 +2357,178 @@ class BatchDownloaderApp(tk.Tk):
                     continue
         raise RuntimeError(last_error)
 
+    def _download_m3u8_video(self, task: DownloadTask, opt: VideoOption, folder: Path, retry_count: int) -> Path:
+        final_path: Path | None = None
+        tmp_path: Path | None = None
+        last_error = "未知错误"
+        max_attempts = max(1, int(retry_count) + 1)
+        referers = self._referers_for_task(task)
+        for attempt_round in range(1, max_attempts + 1):
+            for ref in referers:
+                if self.stop_event.is_set():
+                    raise RuntimeError("用户停止下载")
+                referer = ref or task.url
+                try:
+                    m3u8_url = opt.direct_url
+                    self._set_task(task, status="下载中", progress=0, stage="解析 m3u8 列表")
+                    for _ in range(4):
+                        master_text, entries = read_m3u8_entries(m3u8_url, referer)
+                        variant = choose_m3u8_variant(master_text, entries)
+                        if variant and ".m3u8" in variant.lower():
+                            m3u8_url = variant
+                            continue
+                        segment_urls = [u for u in entries if ".m3u8" not in u.lower()]
+                        break
+                    else:
+                        raise RuntimeError("m3u8 嵌套层级过深")
+                    if not segment_urls:
+                        raise RuntimeError("m3u8 未找到可下载分片")
+
+                    total_segments = len(segment_urls)
+                    final_path = self._build_video_base_path(folder, opt, ".mp4")
+                    tmp_path = final_path.with_suffix(final_path.suffix + ".part")
+                    downloaded_bytes = 0
+                    completed_segments = 0
+                    segment_parts: dict[int, Path] = {}
+                    workers = max(1, min(PORN_HUB_M3U8_WORKERS, total_segments))
+                    self._set_task(
+                        task,
+                        file_size=0,
+                        progress=0,
+                        stage=f"发现 {total_segments} 个分片，准备 {workers} 线程下载",
+                    )
+                    self.ui_queue.put(("log", f"PornHub m3u8：发现 {total_segments} 个分片，使用 {workers} 线程并发下载。"))
+
+                    with tempfile.TemporaryDirectory(prefix="ph_m3u8_", dir=str(folder)) as seg_tmp:
+                        seg_tmp_path = Path(seg_tmp)
+
+                        def download_segment(idx: int, seg_url: str) -> tuple[int, Path, int]:
+                            part_path = seg_tmp_path / f"{idx:06d}.part"
+                            for seg_try in range(1, 4):
+                                try:
+                                    if self.stop_event.is_set():
+                                        raise RuntimeError("用户停止下载")
+                                    req = make_request(
+                                        seg_url,
+                                        extra_headers={
+                                            "Accept": "video/mp2t,video/*,*/*;q=0.8",
+                                            "Referer": referer,
+                                        },
+                                    )
+                                    total = 0
+                                    with urllib.request.urlopen(req, timeout=M3U8_SEGMENT_TIMEOUT) as resp, part_path.open("wb") as pf:
+                                        while True:
+                                            if self.stop_event.is_set():
+                                                raise RuntimeError("用户停止下载")
+                                            chunk = resp.read(1024 * 1024)
+                                            if not chunk:
+                                                break
+                                            pf.write(chunk)
+                                            total += len(chunk)
+                                    if total <= 0:
+                                        raise RuntimeError("空分片")
+                                    return idx, part_path, total
+                                except Exception as exc:
+                                    if part_path.exists():
+                                        try:
+                                            part_path.unlink()
+                                        except OSError:
+                                            pass
+                                    if seg_try >= 3:
+                                        raise RuntimeError(
+                                            f"下载 m3u8 分片失败 {idx}/{total_segments}: {describe_exception(exc)}"
+                                        ) from exc
+                                    time.sleep(0.3 * seg_try)
+                            raise RuntimeError(f"下载 m3u8 分片失败 {idx}/{total_segments}")
+
+                        executor = ThreadPoolExecutor(max_workers=workers)
+                        try:
+                            pending_futures = {
+                                executor.submit(download_segment, idx, seg_url)
+                                for idx, seg_url in enumerate(segment_urls, 1)
+                            }
+                            while pending_futures:
+                                if self.stop_event.is_set():
+                                    for future in pending_futures:
+                                        future.cancel()
+                                    raise RuntimeError("用户停止下载")
+                                done_futures, pending_futures = wait(
+                                    pending_futures,
+                                    timeout=STOP_POLL_INTERVAL,
+                                    return_when=FIRST_COMPLETED,
+                                )
+                                if not done_futures:
+                                    continue
+                                for future in done_futures:
+                                    idx, part_path, size = future.result()
+                                    segment_parts[idx] = part_path
+                                    completed_segments += 1
+                                    downloaded_bytes += size
+                                    self._update_transfer_stats(task, downloaded_bytes, 0)
+                                    task.progress = max(0, min(90, completed_segments * 90 / total_segments))
+                                    task.file_size = downloaded_bytes
+                                    task.stage = f"下载分片 {completed_segments}/{total_segments}"
+                                    self.ui_queue.put(("task", task))
+                        finally:
+                            executor.shutdown(wait=True, cancel_futures=True)
+
+                        self.ui_queue.put(("log", f"PornHub m3u8：分片下载完成，开始合并 {total_segments} 个分片。"))
+                        task.progress = max(task.progress, 90)
+                        task.stage = f"合并分片 0/{total_segments}"
+                        self.ui_queue.put(("task", task))
+                        merge_step = max(1, total_segments // 100)
+                        with tmp_path.open("wb") as out:
+                            for idx in range(1, total_segments + 1):
+                                part_path = segment_parts.get(idx)
+                                if not part_path or not part_path.exists():
+                                    raise RuntimeError(f"m3u8 分片缺失：{idx}/{total_segments}")
+                                with part_path.open("rb") as pf:
+                                    while True:
+                                        if self.stop_event.is_set():
+                                            raise RuntimeError("用户停止下载")
+                                        chunk = pf.read(1024 * 1024)
+                                        if not chunk:
+                                            break
+                                        out.write(chunk)
+                                if idx == total_segments or idx % merge_step == 0:
+                                    task.progress = max(90, min(99, 90 + idx * 9 / total_segments))
+                                    task.stage = f"合并分片 {idx}/{total_segments}"
+                                    self.ui_queue.put(("task", task))
+                        task.progress = 99
+                        task.stage = "写入最终文件"
+                        self.ui_queue.put(("task", task))
+                    if not final_path or not tmp_path:
+                        raise RuntimeError("下载路径生成失败")
+                    os.replace(tmp_path, final_path)
+                    return final_path
+                except Exception as exc:
+                    last_error = describe_exception(exc)
+                    write_log(
+                        "m3u8 下载尝试失败\n"
+                        f"task={task.url}\n"
+                        f"direct={opt.direct_url}\n"
+                        f"round={attempt_round}/{max_attempts} referer={ref!r}\n"
+                        f"error={last_error}\n"
+                        + traceback.format_exc()
+                    )
+                    if tmp_path and tmp_path.exists():
+                        try:
+                            tmp_path.unlink()
+                        except OSError:
+                            pass
+                    tmp_path = None
+                    final_path = None
+                    continue
+        raise RuntimeError(last_error)
+
     def _push_download_progress(self, task: DownloadTask, downloaded: int, total: int) -> None:
+        self._update_transfer_stats(task, downloaded, total)
         if total:
             task.progress = max(0, min(100, downloaded * 100 / total))
+            task.stage = f"下载直链 {task.progress:.0f}%"
         else:
             task.progress = 0
+            task.stage = "下载直链"
         self.ui_queue.put(("task", task))
 
     def _poll_ui_queue(self) -> None:
