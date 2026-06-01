@@ -58,4 +58,4 @@ dist/XTwitter批量视频下载器.exe
 - 下载失败时会在当前目录生成 `downloader_error.log`，可用于排查问题。
 -
 ## 友链
-linuxdo nodeseek
+[Linux.do](https://linux.do/)
